@@ -4013,6 +4013,7 @@ static int mailbox_update_sieve(struct mailbox *mailbox,
             goto done;
         }
 
+        sdata->lastupdated = new->internaldate;
         sdata->mailbox = mailbox->name;
         sdata->imap_uid = new->uid;
         sdata->modseq = new->modseq;
