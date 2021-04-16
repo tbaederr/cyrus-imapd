@@ -76,6 +76,15 @@ EXPORTED void dynarray_free(struct dynarray **dap)
     *dap = NULL;
 }
 
+EXPORTED void *dynarray_release(struct dynarray *da)
+{
+    void *data = da->data;
+    size_t membsize = da->membsize;
+    memset(da, 0, sizeof(struct dynarray));
+    da->membsize = membsize;
+    return data;
+}
+
 #define QUANTUM     16
 static inline int grow(int have, int want)
 {

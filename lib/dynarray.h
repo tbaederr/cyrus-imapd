@@ -63,5 +63,6 @@ extern void *dynarray_nth(const struct dynarray *da, int idx);
 extern int dynarray_size(struct dynarray *da);
 extern void dynarray_truncate(struct dynarray *da, int newlen);
 
+extern void *dynarray_release(struct dynarray *da);
 
 #endif /* __CYRUS_DYNARRAY_H__ */
