@@ -191,7 +191,7 @@ static void jmap_init(struct buf *serverinfo)
     jmap_sieve_init(&my_jmap_settings);
 #endif
 
-    jmap_push_poll = config_getduration(IMAPOPT_WEBSOCKET_PUSHPOLL, 's');
+    jmap_push_poll = config_getduration(IMAPOPT_JMAP_PUSHPOLL, 's');
     if (jmap_push_poll < 0) jmap_push_poll = 0;
 
     if (ws_enabled() && jmap_push_poll) {
@@ -1445,6 +1445,8 @@ static struct prot_waitevent *es_push(struct protstream *s __attribute__((unused
 /* Handle a GET on the eventsource endpoint */
 static int jmap_eventsource(struct transaction_t *txn)
 {
+    if (!jmap_push_poll) return HTTP_NO_CONTENT;
+
     jmap_push_ctx_t *jpush = NULL;
     modseq_t lastmodseq = ULLONG_MAX;
 
