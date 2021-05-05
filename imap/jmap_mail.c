@@ -2399,10 +2399,65 @@ static int _email_parse_comparator(jmap_req_t *req,
     return 0;
 }
 
+// XXX we might want to refactor smallarrayu64 to lib
+#define SMALLARRAYU64_ALLOC 8
+
+typedef struct {
+    size_t count;
+    uint8_t data[SMALLARRAYU64_ALLOC];
+    arrayu64_t spillover;
+    int use_spillover;
+} smallarrayu64_t;
+
+#define SMALLARRAYU64_INITIALIZER { 0, { 0 }, ARRAY64_INITALIZER, 0 }
+
+static int smallarrayu64_append(smallarrayu64_t *sa, uint64_t num)
+{
+    if (sa->count < SMALLARRAYU64_ALLOC && !sa->use_spillover) {
+        if (num <= UINT8_MAX) {
+            sa->data[sa->count] = num;
+            return sa->count++;
+        }
+        /* can't store num in preallocated data */
+        sa->use_spillover = 1;
+    }
+    return arrayu64_append(&sa->spillover, num);
+}
+
+static size_t smallarrayu64_size(smallarrayu64_t *sa)
+{
+    return sa->count + arrayu64_size(&sa->spillover);
+}
+
+static uint64_t smallarrayu64_nth(smallarrayu64_t *sa, int idx)
+{
+    assert(idx >= 0);
+    if ((size_t)idx < sa->count) {
+        return sa->data[idx];
+    }
+    else {
+        return arrayu64_nth(&sa->spillover, idx - sa->count);
+    }
+}
+
+static void smallarrayu64_init(smallarrayu64_t *sa)
+{
+    arrayu64_init(&sa->spillover);
+    sa->count = 0;
+    sa->use_spillover = 0;
+}
+
+static void smallarrayu64_fini(smallarrayu64_t *sa)
+{
+    arrayu64_fini(&sa->spillover);
+    sa->count = 0;
+    sa->use_spillover = 0;
+}
+
 struct emailquery_match {
     char emailid[JMAP_EMAILID_SIZE];
     char threadid[JMAP_THREADID_SIZE];
-    strarray_t partids;
+    smallarrayu64_t partnums;
 };
 
 struct emailquery_result {
@@ -2415,6 +2470,7 @@ struct emailquery_result {
     int is_guidsearch;
     int is_imapfoldersearch;
     time_t last_accessed;
+    hashu64_table partids;
 };
 
 #define JMAP_EMAILQUERY_RESULT_INITIALIZER { 0 }
@@ -2423,11 +2479,14 @@ static void emailquery_result_reset(struct emailquery_result *qr)
 {
     size_t i;
     for (i = 0; i < qr->uncollapsed_total; i++) {
-        strarray_fini(&qr->uncollapsed_matches[i].partids);
+        smallarrayu64_fini(&qr->uncollapsed_matches[i].partnums);
     }
     free(qr->uncollapsed_matches);
     free(qr->collapsed_matches); // members are shallow copy of uncollapsed
     free(qr->fingerprint);
+    if (qr->partids.size) {
+        free_hashu64_table(&qr->partids, free);
+    }
     memset(qr, 0, sizeof(struct emailquery_result));
 }
 
@@ -3372,10 +3431,11 @@ static int emailquery_guidsearch(jmap_req_t *req,
     for (i = 0; i < gsq.total; i++) {
         struct guidsearch_match *gsqmatch = &gsq.matches[i];
         struct message_guid guid;
+        struct emailquery_match *match = &qr->uncollapsed_matches[i];
         message_guid_decode(&guid, gsqmatch->guidrep);
-        jmap_set_emailid(&guid, qr->uncollapsed_matches[i].emailid);
-        jmap_set_threadid(gsqmatch->cid, qr->uncollapsed_matches[i].threadid);
-        strarray_init(&qr->uncollapsed_matches[i].partids);
+        jmap_set_emailid(&guid, match->emailid);
+        jmap_set_threadid(gsqmatch->cid, match->threadid);
+        smallarrayu64_init(&match->partnums);
     }
 
     for (i = 0; i < gsq.total; i++) {
@@ -3444,6 +3504,13 @@ static int emailquery_uidsearch(jmap_req_t *req,
         xmalloc(sizeof(struct emailquery_match) * found_msgs->count);
     size_t total = 0;
 
+    size_t partnum_seq = 0;
+    hash_table partnum_bypartid = HASH_TABLE_INITIALIZER;
+    if (q->want_partids) {
+        construct_hashu64_table(&qr->partids, 1024, 0);
+        construct_hash_table(&partnum_bypartid, 1024, 0);
+    }
+
     int i;
     for (i = 0 ; i < found_msgs->count; i++) {
         MsgData *md = ptrarray_nth(found_msgs, i);
@@ -3466,20 +3533,33 @@ static int emailquery_uidsearch(jmap_req_t *req,
         struct emailquery_match *match = &matches[total++];
         jmap_set_emailid(&md->guid, match->emailid);
         jmap_set_threadid(md->cid, match->threadid);
-        strarray_init(&match->partids);
+        smallarrayu64_init(&match->partnums);
+
+        /* Add partIds */
         if (q->want_partids) {
             if (md->folder && md->folder->partids.size) {
+                // XXX could do this optimization already during search
                 const strarray_t *partids =
                     hashu64_lookup(md->uid, &md->folder->partids);
-                if (partids && strarray_size(partids)) {
+                if (partids) {
                     int j;
                     for (j = 0; j < strarray_size(partids); j++) {
-                        strarray_append(&match->partids,
-                                strarray_nth(partids, j));
+                        const char *partid = strarray_nth(partids, j);
+                        uint64_t partnum = (uint64_t) hash_lookup(partid, &partnum_bypartid);
+                        if (!partnum) {
+                            partnum = ++partnum_seq;
+                            hash_insert(partid, (void*) partnum, &partnum_bypartid);
+                            hashu64_insert(partnum, xstrdup(partid), &qr->partids);
+                        }
+                        smallarrayu64_append(&match->partnums, partnum);
                     }
                 }
             }
         }
+    }
+
+    if (partnum_bypartid.size) {
+        free_hash_table(&partnum_bypartid, NULL);
     }
 
     if (total < (size_t) found_msgs->count) {
@@ -3625,10 +3705,13 @@ static void emailquery_buildresult(struct emailquery *q,
         /* Set email-part ids */
         if (q->want_partids) {
             json_t *jpartids = json_array();
-            int j;
-            for (j = 0; j < strarray_size(&matches[i].partids); j++) {
-                json_array_append_new(jpartids,
-                        json_string(strarray_nth(&matches[i].partids, j)));
+            size_t j;
+            for (j = 0; j < smallarrayu64_size(&matches[i].partnums); j++) {
+                uint64_t partnum = smallarrayu64_nth(&matches[i].partnums, j);
+                const char *partid = hashu64_lookup(partnum, &qr->partids);
+                if (partid) {
+                    json_array_append_new(jpartids, json_string(partid));
+                }
             }
             if (!json_array_size(jpartids)) {
                 json_decref(jpartids);
