@@ -65,7 +65,6 @@
 #include "bsearch.h"
 #include "carddav_db.h"
 #include "cyr_qsort_r.h"
-#include "dynarray.h"
 #include "hashset.h"
 #include "http_dav.h"
 #include "http_jmap.h"
@@ -3413,8 +3412,9 @@ static int emailquery_uidsearch(jmap_req_t *req,
         return r;
     }
 
+    if (!found_msgs->count) return 0;
+
     /* Initialize search result loop */
-    struct hashset *seen_emails = hashset_new(MESSAGE_GUID_SIZE);
     struct hashset *savedates = NULL;
 
     if (search->sort_savedate) {
@@ -3434,9 +3434,14 @@ static int emailquery_uidsearch(jmap_req_t *req,
         }
     }
 
+
+
     /* Build uncollapsed, unwindowed result */
-    dynarray_t matches;
-    dynarray_init(&matches, sizeof(struct emailquery_match));
+    struct hashset *seen_emails = hashset_new(MESSAGE_GUID_SIZE);
+    struct emailquery_match *matches =
+        xmalloc(sizeof(struct emailquery_match) * found_msgs->count);
+    size_t total = 0;
+
     int i;
     for (i = 0 ; i < found_msgs->count; i++) {
         MsgData *md = ptrarray_nth(found_msgs, i);
@@ -3456,10 +3461,10 @@ static int emailquery_uidsearch(jmap_req_t *req,
             continue;
 
         /* Add message to result */
-        struct emailquery_match match;
-        jmap_set_emailid(&md->guid, match.emailid);
-        jmap_set_threadid(md->cid, match.threadid);
-        strarray_init(&match.partids);
+        struct emailquery_match *match = &matches[total++];
+        jmap_set_emailid(&md->guid, match->emailid);
+        jmap_set_threadid(md->cid, match->threadid);
+        strarray_init(&match->partids);
         if (q->want_partids) {
             if (md->folder && md->folder->partids.size) {
                 const strarray_t *partids =
@@ -3467,18 +3472,21 @@ static int emailquery_uidsearch(jmap_req_t *req,
                 if (partids && strarray_size(partids)) {
                     int j;
                     for (j = 0; j < strarray_size(partids); j++) {
-                        strarray_append(&match.partids,
+                        strarray_append(&match->partids,
                                 strarray_nth(partids, j));
                     }
                 }
             }
         }
-        dynarray_append(&matches, &match);
     }
+
+    if (total < (size_t) found_msgs->count) {
+        matches = realloc(matches, total * sizeof(struct emailquery_match));
+    }
+
     hashset_free(&seen_emails);
-    qr->uncollapsed_total = dynarray_size(&matches);
-    qr->matches = dynarray_release(&matches);
-    dynarray_fini(&matches);
+    qr->uncollapsed_total = total;
+    qr->matches = matches;
 
     return r;
 }
