@@ -1543,6 +1543,7 @@ static json_t *jmap_contact_from_vcard(const char *userid,
     json_t *adr = json_array();
 
     for (entry = card->properties; entry; entry = entry->next) {
+
         if (strcasecmp(entry->name, "adr")) continue;
         json_t *item = json_object();
 
@@ -1593,6 +1594,19 @@ static json_t *jmap_contact_from_vcard(const char *userid,
             buf_appendcstr(&buf, street);
         }
 
+        /* Read countryCode from same-grouped ABADR property, if any */
+        const char *countrycode = NULL;
+        if (entry->group) {
+            struct vparse_entry *iter;
+            for (iter = card->properties; iter; iter = iter->next) {
+                if (!strcasecmpsafe(iter->group, entry->group) &&
+                        !strcasecmp(iter->name, VCARD_APPLE_ABADR_PROPERTY)) {
+                    countrycode = iter->v.value;
+                    break;
+                }
+            }
+        }
+
         json_object_set_new(item, "street",
                             jmap_utf8string(buf_cstring(&buf)));
         json_object_set_new(item, "locality",
@@ -1603,6 +1617,13 @@ static json_t *jmap_contact_from_vcard(const char *userid,
                             jmap_utf8string(strarray_safenth(a, 5)));
         json_object_set_new(item, "country",
                             jmap_utf8string(strarray_safenth(a, 6)));
+
+        if (countrycode) {
+            buf_setcstr(&buf, countrycode);
+            buf_lcase(&buf);
+            json_object_set_new(item, "countryCode",
+                    jmap_utf8string(buf_cstring(&buf)));
+        }
 
         json_array_append_new(adr, item);
     }
@@ -3476,6 +3497,7 @@ static int _addresses_to_card(struct vparse_card *card,
         const char *region = NULL;
         const char *postcode = NULL;
         const char *country = NULL;
+        const char *countrycode = NULL;
         int pe; /* parse error */
 
         /* Mandatory */
@@ -3498,6 +3520,9 @@ static int _addresses_to_card(struct vparse_card *card,
         if (JNOTNULL(json_object_get(item, "label"))) {
             pe = jmap_readprop_full(item, prefix, "label", 0, invalid, "s", &label);
         }
+        if (JNOTNULL(json_object_get(item, "countryCode"))) {
+            pe = jmap_readprop_full(item, prefix, "countryCode", 0, invalid, "s", &countrycode);
+        }
 
         /* Bail out for any property errors. */
         if (!type || !street || !locality ||
@@ -3508,13 +3533,21 @@ static int _addresses_to_card(struct vparse_card *card,
 
         /* Update card. */
         const char *group = NULL;
-        if (label) {
+        if (label || countrycode) {
             /* Add Apple-style label using property grouping */
             buf_reset(&buf);
             buf_printf(&buf, "adr%d", i);
             group = buf_cstring(&buf);
 
-            vparse_add_entry(card, group, VCARD_APPLE_LABEL_PROPERTY, label);
+            if (label)
+                vparse_add_entry(card, group, VCARD_APPLE_LABEL_PROPERTY, label);
+            if (countrycode) {
+                struct buf lcode = BUF_INITIALIZER;
+                buf_setcstr(&lcode, countrycode);
+                buf_lcase(&lcode);
+                vparse_add_entry(card, group, VCARD_APPLE_ABADR_PROPERTY, buf_cstring(&lcode));
+                buf_free(&lcode);
+            }
         }
 
         struct vparse_entry *entry = vparse_add_entry(card, group, "ADR", NULL);
