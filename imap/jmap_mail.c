@@ -2406,8 +2406,9 @@ struct emailquery_match {
 };
 
 struct emailquery_result {
-    struct emailquery_match *matches;
+    struct emailquery_match *uncollapsed_matches;
     size_t uncollapsed_total;
+    struct emailquery_match *collapsed_matches;
     size_t collapsed_total;
     char *fingerprint;
     int is_mutable;
@@ -2422,9 +2423,10 @@ static void emailquery_result_reset(struct emailquery_result *qr)
 {
     size_t i;
     for (i = 0; i < qr->uncollapsed_total; i++) {
-        strarray_fini(&qr->matches[i].partids);
+        strarray_fini(&qr->uncollapsed_matches[i].partids);
     }
-    free(qr->matches);
+    free(qr->uncollapsed_matches);
+    free(qr->collapsed_matches); // members are shallow copy of uncollapsed
     free(qr->fingerprint);
     memset(qr, 0, sizeof(struct emailquery_result));
 }
@@ -3364,16 +3366,16 @@ static int emailquery_guidsearch(jmap_req_t *req,
     guidsearch_sort(req, search->sort, &gsq);
 
     /* Build uncollapsed, unwindowed result */
-    qr->matches = xmalloc(gsq.total * sizeof(struct emailquery_match));
+    qr->uncollapsed_matches = xmalloc(gsq.total * sizeof(struct emailquery_match));
     qr->uncollapsed_total = gsq.total;
     size_t i;
     for (i = 0; i < gsq.total; i++) {
         struct guidsearch_match *gsqmatch = &gsq.matches[i];
         struct message_guid guid;
         message_guid_decode(&guid, gsqmatch->guidrep);
-        jmap_set_emailid(&guid, qr->matches[i].emailid);
-        jmap_set_threadid(gsqmatch->cid, qr->matches[i].threadid);
-        strarray_init(&qr->matches[i].partids);
+        jmap_set_emailid(&guid, qr->uncollapsed_matches[i].emailid);
+        jmap_set_threadid(gsqmatch->cid, qr->uncollapsed_matches[i].threadid);
+        strarray_init(&qr->uncollapsed_matches[i].partids);
     }
 
     for (i = 0; i < gsq.total; i++) {
@@ -3486,7 +3488,7 @@ static int emailquery_uidsearch(jmap_req_t *req,
 
     hashset_free(&seen_emails);
     qr->uncollapsed_total = total;
-    qr->matches = matches;
+    qr->uncollapsed_matches = matches;
 
     return r;
 }
@@ -3541,12 +3543,21 @@ done:
     return r;
 }
 
-static void emailquery_sliceresult(struct emailquery *q,
+static void emailquery_buildresult(struct emailquery *q,
                                      struct emailquery_result *qr,
                                      json_t **errp)
 {
     /* Slice matches to [pos,pos+n) */
-    size_t total = q->collapse_threads ? qr->collapsed_total : qr->uncollapsed_total;
+    struct emailquery_match *matches;
+    size_t total;
+    if (q->collapse_threads) {
+        matches = qr->collapsed_matches;
+        total = qr->collapsed_total;
+    }
+    else {
+        matches = qr->uncollapsed_matches;
+        total = qr->uncollapsed_total;
+    }
     size_t pos, n = 0;
     if (q->super.anchor) {
         pos = 0;
@@ -3567,7 +3578,7 @@ static void emailquery_sliceresult(struct emailquery *q,
             if (q->super.have_limit && n == q->super.limit) {
                 break;
             }
-            struct emailquery_match *match = qr->matches + i;
+            struct emailquery_match *match = matches + i;
             if (!strcmp(match->emailid, q->super.anchor)) {
                 /* Found anchor */
                 found_anchor = 1;
@@ -3606,41 +3617,41 @@ static void emailquery_sliceresult(struct emailquery *q,
     for (i = pos; i < top; i++) {
         if (want_threads) {
             /* Keep track of thread ids in result */
-            hashset_add(want_threads, qr->matches[i].threadid);
+            hashset_add(want_threads, matches[i].threadid);
         }
         /* Set email id */
         json_array_append_new(q->super.ids,
-                json_string(qr->matches[i].emailid));
+                json_string(matches[i].emailid));
         /* Set email-part ids */
         if (q->want_partids) {
             json_t *jpartids = json_array();
             int j;
-            for (j = 0; j < strarray_size(&qr->matches[i].partids); j++) {
+            for (j = 0; j < strarray_size(&matches[i].partids); j++) {
                 json_array_append_new(jpartids,
-                        json_string(strarray_nth(&qr->matches[i].partids, j)));
+                        json_string(strarray_nth(&matches[i].partids, j)));
             }
             if (!json_array_size(jpartids)) {
                 json_decref(jpartids);
                 jpartids = json_null();
             }
-            json_object_set_new(q->partids, qr->matches[i].emailid, jpartids);
+            json_object_set_new(q->partids, matches[i].emailid, jpartids);
         }
     }
     if (want_threads) {
         q->thread_emailids = json_object();
         for (i = 0; i < qr->uncollapsed_total; i++) {
-            if (!hashset_exists(want_threads, &qr->matches[i].threadid)) {
+            if (!hashset_exists(want_threads, &qr->uncollapsed_matches[i].threadid)) {
                 continue;
             }
             json_t *emailids = json_object_get(q->thread_emailids,
-                    qr->matches[i].threadid);
+                    qr->uncollapsed_matches[i].threadid);
             if (!emailids) {
                 emailids = json_array();
                 json_object_set_new(q->thread_emailids,
-                        qr->matches[i].threadid, emailids);
+                        qr->uncollapsed_matches[i].threadid, emailids);
             }
             json_array_append_new(emailids,
-                    json_string(qr->matches[i].emailid));
+                    json_string(qr->uncollapsed_matches[i].emailid));
         }
         hashset_free(&want_threads);
     }
@@ -3760,18 +3771,15 @@ static json_t *emailquery_run(jmap_req_t *req, struct emailquery *q,
 
         /* Collapse threads */
         if (q->collapse_threads) {
+            result->collapsed_matches =
+                xmalloc(sizeof(struct emailquery_match) * result->uncollapsed_total);
+
             struct hashset *seen_threads = hashset_new(JMAP_THREADID_SIZE);
-            size_t i, j;
-            for (i = 0, j = 0; i < result->uncollapsed_total; i++) {
-                struct emailquery_match *match = result->matches + i;
+            size_t i, j = 0;
+            for (i = 0; i < result->uncollapsed_total; i++) {
+                struct emailquery_match *match = result->uncollapsed_matches + i;
                 if (hashset_add(seen_threads, &match->threadid)) {
-                    if (i != j) {
-                        /* Swap entries with struct copy */
-                        struct emailquery_match tmp = result->matches[j];
-                        result->matches[j] = *match;
-                        *match = tmp;
-                    }
-                    j++;
+                    result->collapsed_matches[j++] = result->uncollapsed_matches[i];
                 }
             }
             result->collapsed_total = j;
@@ -3783,7 +3791,7 @@ static json_t *emailquery_run(jmap_req_t *req, struct emailquery *q,
         /* set search cost info */
         if (jmap_is_using(req, JMAP_PERFORMANCE_EXTENSION)) {
             json_object_set_new(req->perf_details, "filters",
-                    json_pack("[s]", "querycache"));
+                        json_pack("[s]", "querycache"));
         }
         result->last_accessed = time(NULL);
         is_cached = 1;
@@ -3791,7 +3799,7 @@ static json_t *emailquery_run(jmap_req_t *req, struct emailquery *q,
     buf_free(&fingerprint);
 
     /* Build response */
-    emailquery_sliceresult(q, result, errp);
+    emailquery_buildresult(q, result, errp);
     if (*errp) goto done;
     q->super.can_calculate_changes = result->is_mutable;
     q->super.query_state = xstrdupnull(querystate);
